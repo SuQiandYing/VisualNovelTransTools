@@ -21,6 +21,10 @@ class ParseError(Exception):
     pass
 
 
+class BadEscape(ParseError):
+    """译文里出现无法识别的转义。可用的只有 \\n / \\t / \\\\（§4.5 的方言写法）。"""
+
+
 class UnknownLineShape(ParseError):
     """无形态命中。§7.1.3：必须失败，不得返回空结果。"""
 
@@ -328,7 +332,22 @@ def pack_entry(e: ArcEntry, content: bytes) -> bytes:
 # --------------------------------------------------------------------------
 _SHAPES = [(s["id"], re.compile(s["match"]), s) for s in D.LINE_SHAPES]
 _ARG_RULES = {(r["cmd"], r["ordinal"]): r for r in D.CALLEE_STRING_ARGS}
+_INNER_RULES = {(r["cmd"], r["ordinal"]): re.compile(r["inner_regex"])
+                for r in D.CALLEE_STRING_ARGS if r.get("inner_regex")}
 _STR_LIT = re.compile(r'"([^"]*)"')
+
+#: (shape_id, slot_name) -> tag_subtype。来自 LINE_SHAPES 声明期即校验：
+#: 形态有 text_slots 却无 subtype 声明时，parse_script 直接报错而非静默。
+_SUBTYPES = {
+    ("dialogue", "msg"): "dialogue-body",
+    ("dialogue", "speaker"): "speaker-name",
+    ("narration", "msg"): "narration-body",
+    ("choice", "choice"): "choice-option",
+    ("choice_listing", "choice"): "choice-option",
+    ("quoted_narration", "msg"): "quoted-narration-body",
+    ("dialogue_cont", "msg"): "dialogue-continuation",
+    ("cg_label", "label"): "cg-label",
+}
 
 
 _SIG_BUCKET = 20   # dialect-literal-ok: 报告用长度分桶粒度，不参与解析判定
@@ -348,6 +367,21 @@ def line_signature(line: str) -> str:
 
 
 @dataclass
+class ContSpan:
+    """续行片段：同一句正文被作者折到下一物理行的那一段。
+
+    条目的 source 是各片段按行序拼接的结果，因此译者看到的是完整一句
+    （EV_SHAPE_CONT）。改写时主片段写入新译文，续行片段清空——片段各自
+    按 (lineno, col_start, col_end) 定位，仍是按站点不按值（§6.3）。
+    """
+    lineno: int
+    col_start: int
+    col_end: int
+    source: str
+    shape_id: str
+
+
+@dataclass
 class TextSlot:
     """一处可翻译文本，即改写站点（§3：JoinSite 同时是发现依据与改写单位）。"""
     idx: int
@@ -363,6 +397,13 @@ class TextSlot:
     col_end: int
     speaker: str | None = None
     pair_idx: int | None = None
+    #: 别名站点：同文件内正文与主条目相同的重复槽位（DEBUG 分支等）。导出时省略，
+    #: 回封时随主条目一并回填（用户确认的选项归并需求）。None = 主条目。
+    alias_of: int | None = None
+    #: 续行片段（折行的后续物理行）。非空时 source 为各片段拼接结果，
+    #: own_source 保存主片段在原行中的那一段，供改写前逐字校验。
+    cont_spans: list[ContSpan] = field(default_factory=list)
+    own_source: str | None = None
 
 
 @dataclass
@@ -398,6 +439,14 @@ def parse_script(src_id: str, name: str, content: bytes,
     slots: list[TextSlot] = []
     counter = 0
 
+    # 续行合并（EV_SHAPE_CONT）：continuation 形态不产生独立条目，而是并入
+    # **紧邻上一物理行**的正文条目。prev_msg 记住上一行的 msg 槽位；只要中间
+    # 隔了任何其他形态（含空行）就清空，故不会跨段误并（D_22.scr 的信件段落
+    # 引号跨多段但各段之间有空行，实测不受影响）。
+    # 片段之间以原始行终止符相连：导出时由占位符机制呈现为 {{0D}}{{0A}}（§4.5），
+    # 回封时按同一终止符切回原物理行，故行结构逐字节复原。
+    prev_msg: TextSlot | None = None
+
     for lineno, line in enumerate(lines):
         for shape_id, rx, decl in _SHAPES:
             m = rx.match(line)
@@ -410,12 +459,10 @@ def parse_script(src_id: str, name: str, content: bytes,
                 if value is None or not value:
                     continue
                 counter += 1
-                subtype = {
-                    ("dialogue", "msg"): "dialogue-body",
-                    ("dialogue", "speaker"): "speaker-name",
-                    ("narration", "msg"): "narration-body",
-                    ("choice", "choice"): "choice-option",
-                }[(shape_id, slot_name)]
+                subtype = _SUBTYPES.get((shape_id, slot_name))
+                if subtype is None:
+                    raise ParseError(
+                        f"形态 {shape_id} 槽位 {slot_name} 未声明 subtype")
                 ts = TextSlot(
                     idx=counter, lineno=lineno, shape_id=shape_id,
                     slot_name=slot_name, tag=tag, tag_subtype=subtype,
@@ -446,21 +493,72 @@ def parse_script(src_id: str, name: str, content: bytes,
                         tag, subtype, policy = rule["tag"], rule["tag_subtype"], None
                     else:
                         tag, subtype, policy = "misc", D.FROZEN_STRING_ARG_SUBTYPE, "frozen"
+                    # inner_regex：可见正文只是字面量的一部分（如「正文」＋对齐＋标记）。
+                    # 槽位仅覆盖第 1 捕获组；括号与标记留在槽位外，回封时原样保留。
+                    # 未命中时槽位取整串（11 条【…】を見る类）。
+                    src = lit.group(1)
+                    cs = base + lit.start(1)
+                    ce = base + lit.end(1)
+                    if rule:
+                        inner = _INNER_RULES.get((cmd, ordinal))
+                        if inner:
+                            im = inner.search(src)
+                            if im and im.group(1):
+                                cs, ce = cs + im.start(1), cs + im.end(1)
+                                src = im.group(1)
                     slots.append(TextSlot(
                         idx=counter, lineno=lineno, shape_id=shape_id,
                         slot_name=f"arg{ordinal}", tag=tag, tag_subtype=subtype,
                         tag_source="structural",
                         translate_policy=policy or _policy_for(tag, "structural"),
-                        source=lit.group(1),
-                        col_start=base + lit.start(1), col_end=base + lit.end(1),
+                        source=src, col_start=cs, col_end=ce,
                     ))
+            # 续行合并：本行的 msg 并入紧邻上一行的正文条目，不作为独立条目。
+            # 无可依附的上一行时不合并——此时它是自成一句的正文，照常导出。
+            if decl.get("continuation") and "msg" in group_slots and prev_msg is not None:
+                frag = group_slots["msg"]
+                slots.remove(frag)
+                counter -= 1
+                if prev_msg.own_source is None:
+                    prev_msg.own_source = prev_msg.source
+                prev_msg.cont_spans.append(ContSpan(
+                    lineno=frag.lineno, col_start=frag.col_start,
+                    col_end=frag.col_end, source=frag.source,
+                    shape_id=frag.shape_id))
+                prev_msg.source += term + frag.source
+                group_slots.pop("msg")
+            # 维护续行的依附目标：仅紧邻的上一行有效，隔一行即失效
+            prev_msg = group_slots.get("msg")
             break
         else:
             raise UnknownLineShape(name, lineno, line_signature(line))
 
+    _mark_choice_aliases(slots, name)
+
     return ScriptIR(src_id=src_id, name=name, src_sha256=sha256(content),
                     stored_sha256=stored_sha, lines=lines, shapes=shapes,
                     slots=slots, trailing_terminator=trailing)
+
+
+def _mark_choice_aliases(slots: list[TextSlot], name: str) -> None:
+    """同文件内正文相同的 choice 槽位：首个（行序）为主条目，其余标 alias_of。
+
+    依据（EV_SHAPE_CHOICE_BTN + 用户确认）：本作选项经 btnset 写入，DEBUG 分支与
+    正常分支各写一份同一选项。正文相同 ⇒ 玩家可见文本相同 ⇒ 译文必须一致，
+    归并为一条导出、多站点回填，从机制上杜绝翻译不统一。
+    仅归并 choice（D.CHOICE_ALIAS["tags"]）；msg/name 不归并——同一正文在不同
+    语境可能有不同译法，且 name 可能是多个角色的同一占位写法（如『？？？』）。
+    主条目按行序取首个，判定确定且与导出顺序一致。
+    """
+    tags = set(D.CHOICE_ALIAS["tags"])
+    primary: dict[str, int] = {}
+    for s in slots:
+        if s.tag not in tags:
+            continue
+        if s.source in primary:
+            s.alias_of = primary[s.source]
+        else:
+            primary[s.source] = s.idx
 
 
 def render_script(ir: ScriptIR, overrides: dict[int, str] | None = None) -> bytes:
@@ -468,24 +566,53 @@ def render_script(ir: ScriptIR, overrides: dict[int, str] | None = None) -> byte
 
     改写按 (lineno, col_start, col_end) 定位，同一行多槽位从右向左套用，
     使前面的列偏移不受影响（§6.3 按站点不按值）。
-    """
-    ov = overrides or {}
-    by_line: dict[int, list[TextSlot]] = {}
-    for s in ir.slots:
-        if s.idx in ov and ov[s.idx] != s.source:
-            by_line.setdefault(s.lineno, []).append(s)
 
-    out_lines = list(ir.lines)
-    for lineno, group in by_line.items():
-        line = out_lines[lineno]
-        for s in sorted(group, key=lambda x: x.col_start, reverse=True):
-            if line[s.col_start:s.col_end] != s.source:
-                raise ParseError(
-                    f"{ir.name}:{lineno} idx={s.idx} 站点内容与 IR 不符，拒绝改写")
-            line = line[:s.col_start] + ov[s.idx] + line[s.col_end:]
-        out_lines[lineno] = line
+    别名站点（alias_of）：主条目的译文同时回填到全部别名站点——同文件内正文
+    相同的选项槽位只导出一次，回封时逐站点按各自列区间套用，保证一致（用户
+    确认的需求）。别名站点自身的 source 仍逐字校验，不符即拒绝。
+    """
+    ov = dict(overrides or {})
+    # 展开别名：主条目译文 → 别名站点。逐层解析（本方言归并只有一层）。
+    for s in ir.slots:
+        if s.alias_of is not None and s.alias_of in ov and ov[s.alias_of] != s.source:
+            ov.setdefault(s.idx, ov[s.alias_of])
 
     term = D.SCRIPT["line_terminator"]
+    # 站点表：(lineno, col_start, col_end, 原文, 新文)。折行条目按行终止符切成
+    # 各物理行的片段——片段数必须与原来一致，否则无法判断新的换行落在哪里。
+    edits: dict[int, list[tuple[int, int, str, str, int]]] = {}
+    for s in ir.slots:
+        if s.idx not in ov or ov[s.idx] == s.source:
+            continue
+        new = ov[s.idx]
+        if not s.cont_spans:
+            edits.setdefault(s.lineno, []).append(
+                (s.col_start, s.col_end, s.source, new, s.idx))
+            continue
+        parts = new.split(term)
+        want = len(s.cont_spans) + 1
+        if len(parts) != want:
+            raise ParseError(
+                f"{ir.name} idx={s.idx} 折行条目的换行数被改动："
+                f"原有 {want - 1} 处换行，译文有 {len(parts) - 1} 处。"
+                f"请保留原来的 \\n，数量与位置不变")
+        assert s.own_source is not None
+        edits.setdefault(s.lineno, []).append(
+            (s.col_start, s.col_end, s.own_source, parts[0], s.idx))
+        for span, piece in zip(s.cont_spans, parts[1:]):
+            edits.setdefault(span.lineno, []).append(
+                (span.col_start, span.col_end, span.source, piece, s.idx))
+
+    out_lines = list(ir.lines)
+    for lineno, group in edits.items():
+        line = out_lines[lineno]
+        for cs, ce, old, new, idx in sorted(group, key=lambda t: t[0], reverse=True):
+            if line[cs:ce] != old:
+                raise ParseError(
+                    f"{ir.name}:{lineno} idx={idx} 站点内容与 IR 不符，拒绝改写")
+            line = line[:cs] + new + line[ce:]
+        out_lines[lineno] = line
+
     text = term.join(out_lines) + (term if ir.trailing_terminator else "")
     return text.encode(D.SCRIPT["target_encoding"])
 

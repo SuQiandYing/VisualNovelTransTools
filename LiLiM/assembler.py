@@ -117,7 +117,11 @@ def load_dsat(path: Path, ir: A.ScriptIR) -> dict[int, str]:
         if slot.translate_policy == "frozen" and dst != mo.group("text"):
             raise ImportError_(f"{path.name} idx={idx} 标记 frozen 却被改动")
         if dst != mo.group("text"):
-            plain = DIS.from_display(dst)
+            # 转义先于其他校验：写错的转义必须当场报错，不能当普通字符放过（铁律 4）
+            try:
+                plain = DIS.from_display(dst)
+            except A.BadEscape as exc:
+                raise ImportError_(f"{path.name} idx={idx} {exc}") from None
             try:
                 plain.encode(D.SCRIPT["target_encoding"])
             except UnicodeEncodeError as exc:
@@ -127,6 +131,16 @@ def load_dsat(path: Path, ir: A.ScriptIR) -> dict[int, str]:
             if re.findall(r"\{\{([0-9A-F]{2}(?::[0-9A-F]{2})*)\}\}", dst) != \
                re.findall(r"\{\{([0-9A-F]{2}(?::[0-9A-F]{2})*)\}\}", mo.group("text")):
                 raise ImportError_(f"{path.name} idx={idx} 占位符集合被改动")
+            # 折行条目的换行数必须与原文一致：少一个 \n 就无法判断新的断行落在哪。
+            # 按**还原后**的真实换行计数，不按显示串——显示串里的 `\\n`
+            # （字面反斜杠 + n）含有 `\n` 子串，按串计数会误判。
+            term = D.SCRIPT["line_terminator"]
+            n_old = slot.source.count(term)
+            n_new = plain.count(term)
+            if n_old != n_new:
+                raise ImportError_(
+                    f"{path.name} idx={idx} 换行数被改动：原文有 {n_old} 处换行，"
+                    f"译文有 {n_new} 处。" + r"请保留原来的 \n，数量与位置不变")
             edits[idx] = plain
         i += 2
     return edits

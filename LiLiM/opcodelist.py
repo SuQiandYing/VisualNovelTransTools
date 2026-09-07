@@ -87,6 +87,17 @@ LINE_SHAPES = [
     {"id": "blank", "match": r"^[ \t　]*$", "text_slots": {},
      "evidence_refs": ["EV_SHAPE_BLANK"], "confidence": "observed"},
 
+    # 选项清单注释行（EV_SHAPE_CHOICE_LIST，用户确认需要提取）：
+    # '#//①「正文」（好感度标记）' 是脚本作者维护的选项清单，正文与 btnset 一致
+    # （58/66）或是无 btnset 文件里选项文本的唯一记录（8/66，如 03_03）。
+    # 编号前缀（①-⑳/数字）与括号注记不属于正文，留在槽位外。
+    # 判定顺序在 comment 之前；无编号的 '#//「…」' 是开发者注记（原台词参照、
+    # 路由说明、说话者显示注记），保持 comment 不提取。
+    {"id": "choice_listing",
+     "match": r"^#[ \t]*//[ \t]*(?:[①-⑳]|[0-9]{1,2})[「『](?P<choice>[^」』]*)[」』]",
+     "text_slots": {"choice": "choice"},
+     "evidence_refs": ["EV_SHAPE_CHOICE_LIST"], "confidence": "derived"},
+
     {"id": "comment", "match": r"^[ \t]*#.*$", "text_slots": {},
      "evidence_refs": ["EV_SHAPE_COMMENT"], "confidence": "derived"},
 
@@ -130,14 +141,50 @@ LINE_SHAPES = [
      "match": r"^　(?P<msg>.*)$",
      "text_slots": {"msg": "msg"},
      "evidence_refs": ["EV_SHAPE_NARRATION"], "confidence": "derived"},
+
+    # 本作新增形态（EV_SHAPE_QUOTED / EV_SHAPE_CONT / EV_SHAPE_CGLABEL）：
+    # 引号起首的第三人称旁白（引用语直接开行，无说话者槽）。
+    # 起首的 「/『 **属于正文**：与 dialogue 形态一致（其 msg 槽含完整的「」），
+    # 否则译者看到的原文缺开引号，且译文无法自行补回（槽位外的字符不可改）。
+    {"id": "quoted_narration",
+     "match": r"^(?P<msg>[「『].*)$",
+     "text_slots": {"msg": "msg"},
+     "evidence_refs": ["EV_SHAPE_QUOTED"], "confidence": "derived"},
+
+    # 对话折行的续行（kaomoji 表情、以非结构起首字符开行）。
+    # 判定顺序最末：仅在前述形态全部未命中时才可能命中，不会吞噬其他形态。
+    # continuation=True：本形态不产生独立条目，而是并入紧邻上一行的正文条目，
+    # 使译者看到完整一句（EV_SHAPE_CONT）。行间的换行以占位符呈现，回封时
+    # 按占位符切回原来的物理行，故行结构逐字节复原。
+    {"id": "dialogue_cont",
+     "match": r"^(?![\[　「『ｔ0-9A-Za-z_%#^:\s])(?P<msg>.+)$",
+     "text_slots": {"msg": "msg"},
+     "continuation": True,
+     "evidence_refs": ["EV_SHAPE_CONT"], "confidence": "derived"},
+
+    # 立绘 CG 标签：全角字母数字前缀（半宽化后与前一 chon() 资产 ID 一致）+ 表情注记。
+    # 开发者索引行，非游戏可见文本 → misc / review-required（§4.2 角色未证明）。
+    {"id": "cg_label",
+     "match": r"^[０-９ａ-ｚＡ-Ｚ]+(?P<label>[^ \t\r\n]*)$",
+     "text_slots": {"label": "misc"},
+     "evidence_refs": ["EV_SHAPE_CGLABEL"], "confidence": "derived"},
 ]
 
 # call 形态的字符串参数：绝大多数是资产 ID（在 grp.aos / cv.aos / bgm / se / movie
 # 中存在同名条目，19,802 / 19,848 命中），因此默认 frozen。只有以下命令的指定序号
 # 参数经证明是玩家可见文本。
+# 序号按 _STR_LIT 枚举的**字符串字面量**序号计，不按原始参数位计。
+# 本作 EV_SHAPE_CHOICE_BTN：btnset 的第 1 个字面量（第 0 个恒为窗口资源 ID）是
+# 玩家可见的选项文本（192/192）。其中 181 条形如「选项正文」＋可选的全角空格对齐
+# ＋好感度标记（トワ好感度○），仅「」内正文可翻译（用户确认）；「」外部分
+# （括号、对齐、标记）不属于任何槽位，回封时原样保留。11 条无「」（【…】を見る）
+# 整串可翻译。inner_regex 命中时槽位取第 1 捕获组，未命中时槽位取整串。
 CALLEE_STRING_ARGS = [
     {"cmd": "title", "ordinal": 0, "tag": "ui", "tag_subtype": "window-title",
      "evidence_refs": ["EV_TITLE_ARG"], "confidence": "derived"},
+    {"cmd": "btnset", "ordinal": 1, "tag": "choice", "tag_subtype": "choice-option",
+     "inner_regex": r"「([^」]*)」",
+     "evidence_refs": ["EV_SHAPE_CHOICE_BTN"], "confidence": "derived"},
 ]
 
 # 其余命令的字符串参数一律 frozen，并记 subtype 便于审计。
@@ -155,6 +202,7 @@ PLACEHOLDER = {
 TAG_SUBTYPES = [
     "dialogue-body", "narration-body", "speaker-name",
     "choice-option", "window-title", "asset-id",
+    "quoted-narration-body", "dialogue-continuation", "cg-label",
 ]
 
 # 默认 translate_policy 映射（§4.3）。
@@ -191,4 +239,33 @@ DECODE_TIER = {
     "container": "T2",
     "script": "T2",
     "evidence_refs": ["EV_AOSV2_INDEX", "EV_SCR_PLAINTEXT", "EV_SHAPE_EXHAUSTIVE"],
+}
+
+# 形态判定版本。LINE_SHAPES 与 CALLEE_STRING_ARGS 随作品扩容时递增，
+# 供报告与 vm_analysis 交叉核对（§7.1.5：新增形态须与既有版本可区分）。
+SHAPE_SET_VERSION = "2"
+
+# 继承形态（§7.1 同引擎方言家族）：本方言家族内某一作未出现、其他作实际使用的行形态。
+# 键 = LINE_SHAPES 的 id，值 = 证据指引（写入 shapes.json，供门禁降级为 advisory）。
+# choice：行式「/选项」在本作 0 命中（本作由 btnset 第 1 字面量承载，见
+# EV_SHAPE_CHOICE_BTN）；在兄弟语料 あい☆きゃん中 112 行命中（其 EV_SHAPE_CHOICE）。
+# quoted_narration / dialogue_cont / cg_label：本作（恋キセ）实测命中，兄弟语料 0 命中。
+INHERITED_SHAPES = {
+    "choice": "兄弟语料 D:/あい☆きゃんDL/scr/scr.aos 112 行命中"
+              "（本作由 btnset 第 1 字面量承载，见 EV_SHAPE_CHOICE_BTN）",
+    "choice_listing": "本作 66 行命中（EV_SHAPE_CHOICE_LIST）；"
+                      "兄弟语料无该形态（其选项为行式「/选项」）",
+    "quoted_narration": "本作 145 行命中（EV_SHAPE_QUOTED）；兄弟语料 0 行",
+    "dialogue_cont": "本作 1 行命中（EV_SHAPE_CONT）；兄弟语料 0 行",
+    "cg_label": "本作 1,456 行命中（EV_SHAPE_CGLABEL）；兄弟语料 0 行",
+}
+
+# 选项别名归并（用户确认的需求）：同一脚本内正文相同的 choice 槽位（DEBUG 分支与
+# 正常分支各写一份 btnset）只导出一次，回封时回填全部站点。alias_scope 指明归并范围；
+# alias_exempt 列出不参与归并的命令（title 等 UI 参数不在选项语义内，保持逐条导出）。
+CHOICE_ALIAS = {
+    "tags": ["choice"],
+    "scope": "per-file",
+    "evidence_refs": ["EV_SHAPE_CHOICE_BTN"],
+    "confidence": "derived",
 }

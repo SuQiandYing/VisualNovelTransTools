@@ -34,29 +34,96 @@ PH_SAFE_MIN = D.PLACEHOLDER["display_min_codepoint"]
 #: 实测：130 个剧本脚本最低 0.10，唯一被排除的 main.scr 为 0.001（927 行 1 条正文）。
 SCENARIO_BODY_RATIO = 0.05  # dialect-literal-ok: 报告分类阈值，不参与解析
 
+#: 产出 msg 槽位的行形态。完备性不变式（msg == 正文行数）据此从 LINE_SHAPES 派生，
+#: 与 aoslib 的 tag 声明同源——新增产出 msg 的形态时同步此集合，防止漂移。
+MSG_YIELDING_TAGS = frozenset({"msg"})
+MSG_YIELDING_SHAPES = frozenset(
+    s["id"] for s in D.LINE_SHAPES if any(
+        t == "msg" for t in s.get("text_slots", {}).values()))
+
 
 # --------------------------------------------------------------------------
 # 占位符（§4.5）
 # --------------------------------------------------------------------------
+#: 折行条目里的换行与制表符用反斜杠转义呈现，而不是 {{0D:0A}} 占位符。
+#: 前提（实测）：本方言的脚本正文里**字面反斜杠出现 0 次**（`\` / `￥` / `¥` 全语料
+#: 皆为 0），故 `\n` 无歧义。为使译者仍能输入反斜杠，`\\` 表示一个字面反斜杠——
+#: 转义是双向闭合的，to_display / from_display 互为逆函数（有测试锁定）。
+#: 其余不可显示字节仍走 {{XX}} 成组占位符（§4.5）。
+ESCAPES = {
+    "\\": "\\\\",
+    "\r\n": "\\n",
+    "\t": "\\t",
+}
+UNESCAPES = {"\\": "\\", "n": "\r\n", "t": "\t"}
+
+
 def to_display(s: str) -> str:
-    """把不可安全显示的字符转成 {{XX}}。斜杠、全角空格等照原样保留。"""
-    out = []
+    """把不可安全显示的字符转成可编辑写法。全角空格、斜线等照原样保留。
+
+    换行 → `\\n`，制表符 → `\\t`，字面反斜杠 → `\\\\`；其余控制字节与解码失败
+    字节 → 成组 `{{XX}}`（连续字节合并进同一个占位符）。
+    """
+    out: list[str] = []
     enc = D.SCRIPT["source_encoding"]
-    for ch in s:
-        if ord(ch) < PH_SAFE_MIN:
-            out.append("{{%s}}" % ":".join("%02X" % b for b in ch.encode(enc)))
+    run: list[int] = []
+    i, n = 0, len(s)
+
+    def flush() -> None:
+        if run:
+            out.append("{{%s}}" % ":".join("%02X" % b for b in run))
+            run.clear()
+
+    while i < n:
+        two = s[i:i + 2]
+        if two in ESCAPES:                    # \r\n 必须整对匹配，先于单字符判定
+            flush()
+            out.append(ESCAPES[two])
+            i += 2
+            continue
+        ch = s[i]
+        if ch in ESCAPES:
+            flush()
+            out.append(ESCAPES[ch])
+        elif ord(ch) < PH_SAFE_MIN:
+            run.extend(ch.encode(enc))
         else:
+            flush()
             out.append(ch)
+        i += 1
+    flush()
     return "".join(out)
 
 
 def from_display(s: str) -> str:
-    """占位符还原为字符。"""
+    """可编辑写法还原为字符。无法识别的转义即报错，不静默放过（铁律 4）。"""
     import re
+    BadEscape = A.BadEscape
     enc = D.SCRIPT["target_encoding"]
-    def sub(m: "re.Match[str]") -> str:
-        return bytes(int(b, 16) for b in m.group(1).split(":")).decode(enc)
-    return re.sub(r"\{\{([0-9A-F]{2}(?::[0-9A-F]{2})*)\}\}", sub, s)
+    ph = re.compile(r"\{\{([0-9A-F]{2}(?::[0-9A-F]{2})*)\}\}")
+    out: list[str] = []
+    i, n = 0, len(s)
+    while i < n:
+        ch = s[i]
+        if ch == "\\":
+            nxt = s[i + 1: i + 2]
+            if nxt not in UNESCAPES:
+                what = repr("\\" + nxt) if nxt else "行尾的单个反斜杠"
+                raise BadEscape(
+                    "无法识别的转义 " + what
+                    + "；可用的只有 \\n（换行）、\\t（制表符）、\\\\（反斜杠本身）")
+            out.append(UNESCAPES[nxt])
+            i += 2
+            continue
+        if ch == "{":
+            m = ph.match(s, i)
+            if m:
+                out.append(bytes(int(b, 16) for b in m.group(1).split(":")).decode(enc))
+                i = m.end()
+                continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
 
 
 def encoded_len(display_text: str) -> int:
@@ -148,7 +215,9 @@ def render_asm_text(ir: A.ScriptIR) -> str:
         prefix = f"L{lineno:06d}"
         if tagged:
             ids = " ".join(
-                f'sid={s.idx}:{s.tag}' for s in sorted(tagged, key=lambda x: x.col_start))
+                (f'sid={s.idx}:{s.tag}' if s.alias_of is None
+                 else f'-> sid={s.alias_of} (共享)')
+                for s in sorted(tagged, key=lambda x: x.col_start))
             L.append(f'{prefix}  .line {shape:9s} "{to_display(line)}"   ; {ids}')
         else:
             L.append(f'{prefix}  .line {shape:9s} "{to_display(line)}"')
@@ -170,8 +239,14 @@ def render_asm(src: Path, outdir: Path, ir_bundle=None) -> dict[str, Any]:
 # 入口二：文本提取（文本编辑面，§4.6）
 # --------------------------------------------------------------------------
 def render_dsat(ir: A.ScriptIR) -> str:
-    """双行文本。导出时译文行预填原文（§4.6）。"""
-    tags = " ".join(sorted({s.tag for s in ir.slots})) or "misc"
+    """双行文本。导出时译文行预填原文（§4.6）。
+
+    别名站点（同文件内与主条目正文相同的 choice 重复槽位）不导出：同一选项
+    只出现一次，回封时回填全部站点（aoslib.render_script）。省略必须在
+    _index.tsv 可见，不静默消失。
+    """
+    exported = [s for s in ir.slots if s.alias_of is None]
+    tags = " ".join(sorted({s.tag for s in exported})) or "misc"
     out = [
         f"# TEXT/2 ir={D.IR_VERSION} tool={D.TOOL_VERSION} src_sha256={ir.src_sha256}",
         f"# encoding source={D.SCRIPT['source_encoding']} "
@@ -180,7 +255,7 @@ def render_dsat(ir: A.ScriptIR) -> str:
         f"# tags {tags}",
         "#",
     ]
-    for s in ir.slots:
+    for s in exported:
         disp = to_display(s.source)
         meta = f"# idx={s.idx:08d} line={s.lineno} tag={s.tag}"
         if s.speaker:
@@ -203,12 +278,16 @@ def extract_texts(src: Path, outdir: Path, ir_bundle=None,
 
     # 零条目的源不产出双行文件：没有可编辑内容，空文件只会让译者与门禁都无从判断。
     # 但必须在 _index.tsv 中显式记为 0，使省略可见、可审计，而不是静默消失。
+    # 别名站点（同文件重复选项）不计入 entries：它们不是独立条目，回封时随主条目回填。
     index_rows = []
     for ir in scripts:
-        if ir.slots:
+        n_export = sum(1 for s in ir.slots if s.alias_of is None)
+        n_alias = sum(1 for s in ir.slots if s.alias_of is not None)
+        if n_export:
             (paths["texts"] / f"{ir.name}.txt").write_text(
                 render_dsat(ir), encoding=D.SCRIPT["text_encoding"], newline="\n")
-            index_rows.append(f"{ir.name}\t{ir.name}.txt\t{len(ir.slots)}")
+            suffix = f"\t+{n_alias} 别名站点" if n_alias else ""
+            index_rows.append(f"{ir.name}\t{ir.name}.txt\t{n_export}{suffix}")
         else:
             index_rows.append(f"{ir.name}\t-\t0")
     (paths["texts"] / "_index.tsv").write_text(
@@ -235,13 +314,20 @@ def write_ir(arc: A.Archive, scripts: list[A.ScriptIR],
         for ir in scripts:
             start = line_no
             for s in ir.slots:
+                if s.alias_of is not None:
+                    continue  # 别名站点不是独立条目；回封时随主条目回填
+                # source 存**显示形态**（与双行文件的 ○ 行逐字一致）：导入校验
+                # 拿它做原文锚点比对，两侧写法必须同一套。折行条目的换行在显示
+                # 形态里是 \n，原始形态是 CRLF——存原始形态会让锚点校验必然失败。
+                # 原始形态另存 source_raw 供审计，字节长度仍按原始算。
                 rec = {
                     "src_id": ir.src_id, "idx": s.idx, "line": s.lineno,
                     "shape": s.shape_id, "slot": s.slot_name,
                     "tag": s.tag, "tag_subtype": s.tag_subtype,
                     "tag_source": s.tag_source,
                     "translate_policy": s.translate_policy,
-                    "source": s.source,
+                    "source": to_display(s.source),
+                    "source_raw": s.source,
                     "raw_len": len(s.source.encode(D.SCRIPT["source_encoding"])),
                     "col_start": s.col_start, "col_end": s.col_end,
                 }
@@ -260,7 +346,9 @@ def write_ir(arc: A.Archive, scripts: list[A.ScriptIR],
                     }, ensure_ascii=False) + "\n")
             mf.write(json.dumps({
                 "src_id": ir.src_id, "name": ir.name, "sha256": ir.src_sha256,
-                "stored_sha256": ir.stored_sha256, "entries": len(ir.slots),
+                "stored_sha256": ir.stored_sha256,
+                "entries": sum(1 for s in ir.slots if s.alias_of is None),
+                "alias_sites": sum(1 for s in ir.slots if s.alias_of is not None),
                 "text_entries_lines": [start, line_no],
                 "decode_tier": D.DECODE_TIER["script"],
             }, ensure_ascii=False) + "\n")
@@ -385,6 +473,14 @@ def write_reports(arc: A.Archive, scripts: list[A.ScriptIR],
         shape_counts = Counter(ir.shapes)
         dlg = shape_counts.get("dialogue", 0)
         nar = shape_counts.get("narration", 0)
+        # 产出 msg 槽位的形态全集：dialogue / narration / quoted_narration / dialogue_cont。
+        # 完备性不变式必须按「产出 msg 的形态」计数，新增形态自动纳入（§7.1.5）。
+        msg_shapes = MSG_YIELDING_SHAPES & {sid for sid, n in shape_counts.items() if n}
+        quoted = shape_counts.get("quoted_narration", 0)
+        cont = shape_counts.get("dialogue_cont", 0)
+        # 折行片段并入了上一条正文（EV_SHAPE_CONT），故不各自成条目：
+        # 不变式右侧要扣掉已合并的片段数，否则会把正确的合并误报成漏抽。
+        merged = sum(len(s.cont_spans) for s in ir.slots)
         row = {
             "sample": ir.name,
             "byte_size": sum(
@@ -392,15 +488,19 @@ def write_reports(arc: A.Archive, scripts: list[A.ScriptIR],
                 len(D.SCRIPT["line_terminator"]) for l in ir.lines),
             "tags": dict(tags),
             "containers": {"lines": len(ir.lines),
-                           "dialog_entries": dlg + nar,
+                           "dialog_entries": dlg + nar + quoted + cont - merged,
                            "dialogue_lines": dlg, "narration_lines": nar,
+                           "quoted_narration_lines": quoted,
+                           "dialogue_cont_lines": cont,
+                           "merged_continuations": merged,
                            "select_entries": shape_counts.get("choice", 0)},
         }
         # 分类依据是结构，不是文件名（§7.1.2 的同一原则：禁止按名字选分支）。
         # 剧本脚本 = 正文行占比达阈值；控制流脚本（分支路由、菜单）即便含个别
         # 正文行，其密度也由 directive/assign 决定，与剧本不可比。
-        body_ratio = (dlg + nar) / len(ir.lines) if ir.lines else 0.0
-        is_scenario = (dlg or nar) and body_ratio >= SCENARIO_BODY_RATIO
+        body = dlg + nar + quoted + cont
+        body_ratio = body / len(ir.lines) if ir.lines else 0.0
+        is_scenario = bool(msg_shapes) and body_ratio >= SCENARIO_BODY_RATIO
         row["containers"]["body_line_ratio"] = round(body_ratio, 4)
         if is_scenario:
             scenario_rows.append(row)
@@ -446,7 +546,8 @@ def write_reports(arc: A.Archive, scripts: list[A.ScriptIR],
     ]
     (repdir / "completeness_invariant.json").write_text(
         json.dumps({"ok": not invariant_fail,
-                    "rule": "msg == dialogue_lines + narration_lines",
+                    "rule": "msg == dialogue + narration + quoted_narration"
+                            " + dialogue_cont - merged_continuations",
                     "checked_samples": len(scenario_rows) + len(plumbing_rows),
                     "scenario_samples": len(scenario_rows),
                     "plumbing_samples": len(plumbing_rows),
@@ -462,28 +563,46 @@ def write_reports(arc: A.Archive, scripts: list[A.ScriptIR],
             slot["entries"] += sc[shape_id]
         for s in ir.slots:
             observed.setdefault(s.shape_id, {"entries": 0, "texts": 0})["texts"] += 1
+            # 续行片段的文本并入了主条目，但它确实被提取了——按其**自身形态**
+            # 计入 texts，否则该形态显示为「匹配了行却 0 条文本」，
+            # 与 BARREN_SHAPE（真正的漏抽）混为一谈（§8.3 假阳性）。
+            for span in s.cont_spans:
+                observed.setdefault(span.shape_id,
+                                    {"entries": 0, "texts": 0})["texts"] += 1
     declared = [s["id"] for s in D.LINE_SHAPES]
     # 无文本槽位的形态是声明如此，不构成 BARREN：以 entries 计为 texts 免除误判
     for shape in D.LINE_SHAPES:
         if not shape["text_slots"] and not shape.get("arg_text_rule"):
             if shape["id"] in observed:
                 observed[shape["id"]]["texts"] = observed[shape["id"]]["entries"]
-    shapes_rep = {"declared": declared, "observed": observed, "unmatched": {}}
+    # 继承形态（§7.1 同引擎方言家族）：本作未出现但兄弟语料实际使用的形态，
+    # 显式申报证据指引后由门禁降级为 advisory；未申报的零命中仍是失败。
+    inherited = {sid: note for sid, note in D.INHERITED_SHAPES.items()
+                 if sid in declared and observed.get(sid, {}).get("entries", 0) == 0}
+    shapes_rep = {"declared": declared, "observed": observed, "unmatched": {},
+                  "inherited": inherited}
     (repdir / "shapes.json").write_text(
         json.dumps(shapes_rep, ensure_ascii=False, indent=1),
         encoding="utf-8", newline="\n")
 
     tag_totals = Counter()
     src_totals = Counter()
+    n_alias = 0
     for ir in scripts:
         for s in ir.slots:
             tag_totals[s.tag] += 1
             src_totals[s.tag_source] += 1
+            if s.alias_of is not None:
+                n_alias += 1
+    n_exported = sum(len(ir.slots) for ir in scripts) - n_alias
     summary = {
         "archive": arc.path.name, "src_sha256": arc.src_sha256,
         "entries": len(arc.entries), "scripts": len(scripts),
         "opaque_entries": opaque,
-        "text_entries": sum(len(ir.slots) for ir in scripts),
+        # 条目数 = 可编辑条目（主条目）；别名站点单列——它们不是条目，
+        # 回封时随主条目回填。两项之和 = IR 槽位总数。
+        "text_entries": n_exported,
+        "alias_sites": n_alias,
         "tag_counts": dict(tag_totals),
         "tag_source_counts": {k: src_totals.get(k, 0) for k in
                               ("structural", "anchor", "binding", "heuristic",
@@ -538,11 +657,13 @@ def run_extract(src: Path, outdir: Path, want_texts: bool = True,
             "自检未通过：不修改任何内容重建出的文件与原件不一致，"
             "此文件暂不支持装回。已导出的文本仅供阅读，请勿用于回封。")
 
-    policy = Counter(s.translate_policy for ir in scripts for s in ir.slots)
+    policy = Counter(s.translate_policy for ir in scripts
+                     for s in ir.slots if s.alias_of is None)
     return {
         "entries": len(scripts), "opaque_entries": len(opaque),
         "parse_failed": [o["name"] for o in opaque if o.get("status") == "parse-failed"],
         "text_entries": summary["text_entries"],
+        "alias_sites": summary["alias_sites"],
         "tag_counts": summary["tag_counts"],
         "tag_source_counts": summary["tag_source_counts"],
         "policy_counts": {k: policy.get(k, 0) for k in
@@ -610,7 +731,8 @@ def main(argv: list[str] | None = None) -> int:
     print(f"归档 {src.name}  脚本 {r['entries']}  非脚本 {r['opaque_entries']}")
     if r["parse_failed"]:
         print(f"解析失败 {len(r['parse_failed'])} 个：{r['parse_failed']}")
-    print(f"文本条目 {r['text_entries']}  分布 {r['tag_counts']}")
+    print(f"文本条目 {r['text_entries']}  分布 {r['tag_counts']}"
+          + (f"  别名站点 {r['alias_sites']}（回封时随主条目回填）" if r.get("alias_sites") else ""))
     print(f"可翻译 {r['policy_counts']['translatable']} / "
           f"需确认 {r['policy_counts']['review-required']} / "
           f"锁定 {r['policy_counts']['frozen']}")
