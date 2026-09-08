@@ -1,0 +1,3 @@
+tkinterdnd2>=0.3.0
+# 可选：没有 ffmpeg.exe 时，OP 视频转码可用这个包提供的 ffmpeg
+# imageio-ffmpeg>=0.5.1
