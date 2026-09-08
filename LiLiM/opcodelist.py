@@ -205,6 +205,25 @@ TAG_SUBTYPES = [
     "quoted-narration-body", "dialogue-continuation", "cg-label",
 ]
 
+# 正文格子宽度（EV_TEXT_CELL）。宿主按 2 字节一步画对话/选项/人名。
+# 原文这些 tag 里除行终止符外每个字符编码后都是 2 字节（半角方括号成对包住说话人，
+# 正文本身全是全角）。译文混入半角 ASCII 会把后续双字节从奇数偏移切开，
+# 引擎弹出「表示文字列が不正です」并把后半句显示成乱码。
+# 装回时对这些 tag 的半角 ASCII 自动转全角；转完仍有 1 字节字符则拒绝。
+# halfwidth_range 是 ASCII 可打印区（含空格）；fullwidth_offset 为 Unicode 全角区
+# 的平移量；space 单列，因为全角空格是 U+3000 而非 U+0020+offset。
+TEXT_CELL = {
+    "width": 2,
+    "tags": ["msg", "name", "choice"],
+    "skip_chars": "\r\n",
+    "halfwidth_range": [0x20, 0x7E],
+    "fullwidth_offset": 0xFEE0,
+    "halfwidth_space": 0x20,
+    "fullwidth_space": 0x3000,
+    "evidence_refs": ["EV_TEXT_CELL"],
+    "confidence": "observed",
+}
+
 # 默认 translate_policy 映射（§4.3）。
 POLICY_MAP = {
     "name": "translatable",

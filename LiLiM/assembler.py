@@ -141,6 +141,8 @@ def load_dsat(path: Path, ir: A.ScriptIR) -> dict[int, str]:
                 raise ImportError_(
                     f"{path.name} idx={idx} 换行数被改动：原文有 {n_old} 处换行，"
                     f"译文有 {n_new} 处。" + r"请保留原来的 \n，数量与位置不变")
+            # 正文格子宽度（EV_TEXT_CELL）的全角化统一在 probe 里做，不在此处——
+            # 两处都转会让 probe 数不到半角字符，预览显示的全角化条数恒为 0。
             edits[idx] = plain
         i += 2
     return edits
@@ -249,6 +251,7 @@ def probe(src: Path, outdir: Path, texts_dir: Path | None = None,
 
     all_edits: dict[str, dict[int, str]] = {}
     conflicts: list[dict] = []
+    cell_width_errors: list[dict] = []
     surfaces = {"texts": 0, "asm": 0}
     if not verify_only:
         for ir in scripts:
@@ -271,11 +274,33 @@ def probe(src: Path, outdir: Path, texts_dir: Path | None = None,
             if merged:
                 all_edits[ir.name] = merged
 
-    # 变长统计：按 target_encoding 计算，占位符按展开后字节计（§6.0.2）
+    # 正文格子宽度：半角 ASCII 在统计之前转全角，使预览的长度差与实际写入一致。
+    # 转换幂等（全角再转仍是全角），load_dsat 里已经转过一遍的条目再走一次无副作用。
     by_name = {ir.name: ir for ir in scripts}
+    widened_chars = 0
+    widened_entries = 0
+    enc = D.SCRIPT["target_encoding"]
+    for name, edits in all_edits.items():
+        slots = {s.idx: s for s in by_name[name].slots}
+        for idx, new in list(edits.items()):
+            if slots[idx].tag not in D.TEXT_CELL["tags"]:
+                continue
+            widened, chs = A.widen_ascii(new)
+            leftover = A.check_cell_width(widened, slots[idx].tag, enc)
+            if leftover:
+                cell_width_errors.append({
+                    "source": name, "idx": idx,
+                    "chars": [c for _, c, _ in leftover],
+                })
+                continue
+            if chs:
+                edits[idx] = widened
+                widened_entries += 1
+                widened_chars += len(chs)
+
+    # 变长统计：按 target_encoding 计算，占位符按展开后字节计（§6.0.2）
     grew = 0
     delta_bytes = 0
-    enc = D.SCRIPT["target_encoding"]
     for name, edits in all_edits.items():
         slots = {s.idx: s for s in by_name[name].slots}
         for idx, new in edits.items():
@@ -286,12 +311,15 @@ def probe(src: Path, outdir: Path, texts_dir: Path | None = None,
 
     strategy = "identity" if not all_edits else "pointer-rewrite"
     return {
-        "applicable": not conflicts,
-        "reason_code": "OK" if not conflicts else "EDIT_CONFLICT",
+        "applicable": not conflicts and not cell_width_errors,
+        "reason_code": ("OK" if not conflicts and not cell_width_errors
+                        else "EDIT_CONFLICT" if conflicts else "CELL_WIDTH"),
         "strategy": strategy, "edits": all_edits, "conflicts": conflicts,
+        "cell_width_errors": cell_width_errors,
         "changed_files": len(all_edits),
         "changed_entries": sum(len(v) for v in all_edits.values()),
         "grew_entries": grew, "estimated_text_delta": delta_bytes,
+        "widened_entries": widened_entries, "widened_chars": widened_chars,
         "edit_surfaces": surfaces,
     }
 
@@ -320,6 +348,12 @@ def repack(src: Path, outdir: Path, texts_dir: Path | None = None,
             "两个编辑面改同一条且取值不同，拒绝执行：\n" +
             "\n".join(f"  {c['source']} idx={c['idx']} texts={c['texts']!r} "
                       f"asm={c['asm']!r}" for c in pv["conflicts"]))
+    if pv.get("cell_width_errors"):
+        raise ImportError_(
+            "译文含宿主无法按 2 字节显示的字符，已拒绝装回：\n" +
+            "\n".join(f"  {e['source']} idx={e['idx']}  "
+                      f"{'、'.join(repr(c) for c in e['chars'][:6])}"
+                      for e in pv["cell_width_errors"][:20]))
 
     new_content: dict[int, bytes] = {}
     changed_entries = 0
@@ -489,9 +523,14 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  改动    {pv['changed_entries']} 条译文"
               f"（其中 {pv['grew_entries']} 条变长，共 {pv['estimated_text_delta']:+d} 字节）"
               f"，涉及 {pv['changed_files']} 个脚本")
+        if pv.get("widened_chars"):
+            print(f"  全角化  {pv['widened_entries']} 条里的 {pv['widened_chars']} 个半角字符"
+                  f"（游戏按 2 字节显示正文，半角会把后面的字切断）")
         print(f"  来源    双行文本 {pv['edit_surfaces']['texts']} 条 / "
               f"ASM {pv['edit_surfaces']['asm']} 条")
         print(f"  冲突    {len(pv['conflicts'])}")
+        if pv.get("cell_width_errors"):
+            print(f"  格子宽度 {len(pv['cell_width_errors'])} 条无法转成 2 字节，已拒绝")
         if a.dry_run:
             print("  （--dry-run，未写出任何文件）")
             return 0 if pv["applicable"] else 1

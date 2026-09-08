@@ -25,6 +25,10 @@ class BadEscape(ParseError):
     """译文里出现无法识别的转义。可用的只有 \\n / \\t / \\\\（§4.5 的方言写法）。"""
 
 
+class CellWidthError(ParseError):
+    """译文在格子宽度校验下仍含 1 字节字符（EV_TEXT_CELL）。"""
+
+
 class UnknownLineShape(ParseError):
     """无形态命中。§7.1.3：必须失败，不得返回空结果。"""
 
@@ -423,6 +427,50 @@ def _policy_for(tag: str, tag_source: str) -> str:
     if tag_source == "unresolved":
         return "review-required"
     return D.POLICY_MAP[tag]
+
+
+# 半角 ASCII → 全角。全部数值取自方言声明（§7：结构逻辑不含引擎特定字面量）：
+# 空格单独映射（全角空格是 U+3000，不是 U+0020+offset），其余按 fullwidth_offset
+# 平移进 Unicode 全角区。转义还原后的 \r\n 不转（TEXT_CELL["skip_chars"]）。
+_FW_OFFSET = D.TEXT_CELL["fullwidth_offset"]
+_HALF_MIN, _HALF_MAX = D.TEXT_CELL["halfwidth_range"]
+_HALF_SPACE = D.TEXT_CELL["halfwidth_space"]
+_FW_SPACE = chr(D.TEXT_CELL["fullwidth_space"])
+
+
+def widen_ascii(text: str) -> tuple[str, list[tuple[int, str, str]]]:
+    """把半角 ASCII 转成全角。返回 (新文本, [(位置, 原字符, 全角字符), ...])。
+
+    跳过 TEXT_CELL["skip_chars"]（行终止符）。不在范围内的字符原样保留。
+    """
+    skip = set(D.TEXT_CELL["skip_chars"])
+    out: list[str] = []
+    changes: list[tuple[int, str, str]] = []
+    for i, ch in enumerate(text):
+        o = ord(ch)
+        if ch not in skip and _HALF_MIN <= o <= _HALF_MAX:
+            fw = _FW_SPACE if o == _HALF_SPACE else chr(o + _FW_OFFSET)
+            out.append(fw)
+            changes.append((i, ch, fw))
+        else:
+            out.append(ch)
+    return "".join(out), changes
+
+
+def check_cell_width(text: str, tag: str, enc: str) -> list[tuple[int, str, int]]:
+    """按格子宽度检查：返回仍为 1 字节的字符 [(位置, 字符, 字节数)]。空列表即通过。"""
+    if tag not in D.TEXT_CELL["tags"]:
+        return []
+    skip = set(D.TEXT_CELL["skip_chars"])
+    width = D.TEXT_CELL["width"]
+    bad: list[tuple[int, str, int]] = []
+    for i, ch in enumerate(text):
+        if ch in skip:
+            continue
+        n = len(ch.encode(enc))
+        if n != width:
+            bad.append((i, ch, n))
+    return bad
 
 
 def parse_script(src_id: str, name: str, content: bytes,

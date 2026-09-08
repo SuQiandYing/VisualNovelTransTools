@@ -385,6 +385,15 @@ class App:
                 f"  冲突    {len(pv['conflicts'])}",
                 f"  输出到  {dst}",
             ]
+            if pv.get("widened_chars"):
+                lines.append(
+                    f"  全角化  {pv['widened_entries']} 条里的 {pv['widened_chars']} 个半角字符"
+                    f"（游戏按 2 字节显示正文，半角会把后面的字切断）")
+            if pv.get("cell_width_errors"):
+                lines += ["", "以下条目含无法转成全角的字符，无法装回："]
+                for e in pv["cell_width_errors"][:10]:
+                    lines.append(f"  {e['source']} 第 {e['idx']} 条："
+                                 f"{'、'.join(repr(c) for c in e['chars'][:6])}")
             if pv["changed_entries"] == 0:
                 lines += ["", "没有检测到任何改动，装回后的文件与原件完全相同。"]
         body.insert("1.0", "\n".join(lines))
@@ -420,7 +429,7 @@ class App:
 
             self._run_bg(job)
 
-        if not pv["conflicts"]:
+        if not pv["conflicts"] and not pv.get("cell_width_errors"):
             ttk.Button(bar, text="执 行", command=go).pack(side="right", ipadx=12)
         ttk.Button(bar, text="取 消", command=win.destroy).pack(side="right", padx=8)
 
